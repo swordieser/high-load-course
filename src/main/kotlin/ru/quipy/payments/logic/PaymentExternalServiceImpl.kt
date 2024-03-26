@@ -48,8 +48,8 @@ class PaymentExternalServiceImpl(
             val account =
                 accountService.getAvailableAccountOrNull() ?: throw NotFoundException("There is no available account")
 
-            val accountName = account.accountName
-            val serviceName = account.serviceName
+            val accountName = account.properties.accountName
+            val serviceName = account.properties.serviceName
 
             logger.warn("[$accountName] Submitting payment request for payment $paymentId. Already passed: ${now() - paymentStartedAt} ms")
             logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
@@ -98,6 +98,8 @@ class PaymentExternalServiceImpl(
                         }
                     }
                 }
+            } finally {
+              account.releaseWindow()
             }
         } catch (e: Exception) {
             logger.error("Payment failed for txId: $transactionId, payment: $paymentId", e)
