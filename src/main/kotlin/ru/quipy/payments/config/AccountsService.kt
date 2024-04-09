@@ -1,22 +1,27 @@
 package ru.quipy.payments.config
 
+import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import org.springframework.stereotype.Service
-import ru.quipy.common.utils.NonBlockingOngoingWindow
+import ru.quipy.common.utils.NamedThreadFactory
+import ru.quipy.common.utils.RateLimiter
 import ru.quipy.payments.logic.ExternalServiceProperties
-import java.util.concurrent.atomic.AtomicLong
 import java.time.Duration
+import java.util.*
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 @Service
 class AccountService {
     val accounts = ExternalServicesConfig.properties.map { Account(it) }
 
-    fun getAvailableAccountOrNull(): Account? {
+    fun getAvailableAccountOrNull(paymentStartedAt: Long): Account? {
         return accounts.filter {
-            it.isAvailable()
+            it.isAvailable(paymentStartedAt)
         }.minByOrNull {
             it.properties.callCost
-        }?.apply {
-            this.registerRequest()
         }
     }
 }
@@ -24,31 +29,24 @@ class AccountService {
 class Account(
     val properties: ExternalServiceProperties
 ) {
-    private val lastRequestTime = AtomicLong(System.currentTimeMillis())
-    private val requestsCounter = AtomicLong(0)
-    private val window = NonBlockingOngoingWindow(properties.parallelRequests)
+    private val paymentOperationTimeout = Duration.ofSeconds(80)
+    private val rateLimiter = RateLimiter(properties.rateLimitPerSec)
 
-    fun isAvailable(): Boolean {
-        val now = System.currentTimeMillis()
-        val put = window.putIntoWindow()
+    val httpExecutor = Executors.newFixedThreadPool(properties.parallelRequests)
+    val executor = Executors.newFixedThreadPool(128)
+    val responsePool = Executors.newFixedThreadPool(128, NamedThreadFactory("payment-response"))
 
-        if (!put) {
-            return false
-        }
 
-        if (Duration.ofMillis(now - lastRequestTime.get()) > Duration.ofSeconds(1)) {
-            lastRequestTime.set(now)
-            requestsCounter.set(0)
-        }
+    val httpClient = OkHttpClient.Builder()
+        .dispatcher(Dispatcher(httpExecutor).apply { maxRequests = properties.parallelRequests })
+        .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
+        .connectionPool(ConnectionPool(properties.parallelRequests, paymentOperationTimeout.seconds, TimeUnit.SECONDS))
+        .build()
 
-        return requestsCounter.get() < properties.rateLimitPerSec
+    fun isAvailable(paymentStartedAt: Long): Boolean {
+        return rateLimiter.tick() && Duration.ofSeconds((now() - paymentStartedAt) / 1000) < paymentOperationTimeout
     }
 
-    fun registerRequest() {
-        requestsCounter.incrementAndGet()
-    }
 
-    fun releaseWindow() {
-        window.releaseWindow()
-    }
+    fun now() = System.currentTimeMillis()
 }
