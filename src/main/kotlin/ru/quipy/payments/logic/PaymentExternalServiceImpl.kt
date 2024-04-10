@@ -18,6 +18,8 @@ import java.util.*
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 
 
 // Advice: always treat time as a Duration
@@ -37,37 +39,51 @@ class PaymentExternalServiceImpl(
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 
+    val circuitBreakerConfig = CircuitBreakerConfig.custom()
+        .failureRateThreshold(50.0f)
+        .waitDurationInOpenState(Duration.ofMillis(10000))
+        .build()
+
+    val circuitBreaker = CircuitBreaker.of("paymentService", circuitBreakerConfig)
 
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
-        var account = accountService.accounts.get(0)
-        try {
-            val newAccount =
-                accountService.getAvailableAccountOrNull(paymentStartedAt)
-                    ?: throw NotFoundException("There is no available account")
+        CircuitBreaker.decorateRunnable(circuitBreaker) {
+            var account = accountService.accounts.get(0)
+            try {
+                val newAccount =
+                    accountService.getAvailableAccountOrNull(paymentStartedAt)
+                        ?: throw NotFoundException("There is no available account")
 
-            account = newAccount
-        } catch (e: Exception) {
-            return
-        }
+                account = newAccount
+            } catch (e: Exception) {
+                return@decorateRunnable
+            }
 
-        val transactionId = UUID.randomUUID()
+            val transactionId = UUID.randomUUID()
 
-        val accountName = account.properties.accountName
+            val accountName = account.properties.accountName
 
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId. Already passed: ${now() - paymentStartedAt} ms")
-        logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
+            logger.warn("[$accountName] Submitting payment request for payment $paymentId. Already passed: ${now() - paymentStartedAt} ms")
+            logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
 
-        // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-        // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-        }
+            // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
+            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
 
-        account.executor.submit {
-            processPaymentRequest(paymentId, transactionId, account, paymentStartedAt)
-        }
+            account.executor.submit {
+                try {
+                    processPaymentRequest(paymentId, transactionId, account, paymentStartedAt)
+                } catch (e: Exception) {
+                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
 
-
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = e.message)
+                    }
+                }
+            }
+        }.run()
     }
 
     private fun processPaymentRequest(paymentId: UUID, transactionId: UUID, account: Account, paymentStartedAt: Long) {
